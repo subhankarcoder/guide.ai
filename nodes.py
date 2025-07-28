@@ -106,22 +106,24 @@ async def call_arxiv_safe(query: str, k: int = 5) -> List[Dict]:
         logger.error(f"ArXiv search failed: {str(e)}\n{traceback.format_exc()}")
         return []
 
-async def call_exa_safe(query: str, k: int = 5) -> List[Dict]:
+async def call_exa_safe(query: str, k: int = 5) -> (List[Dict], str):
     """Enhanced Exa search with comprehensive error handling"""
     try:
         logger.info(f"Searching Exa for: '{query}' (limit: {k})")
-        result = await exa.search_web(query, k)
+        results, answer = await exa.search_web(query, k)
         
-        if not result:
+        if not results:
             logger.warning("Exa search returned no results")
-            return []
             
-        logger.info(f"Exa search returned {len(result)} results")
-        return result
+        if not answer:
+            logger.warning("Exa search returned no answer")
+            
+        logger.info(f"Exa search returned {len(results)} results and an answer.")
+        return results, answer
         
     except Exception as e:
         logger.error(f"Exa search failed: {str(e)}\n{traceback.format_exc()}")
-        return []
+        return [], None
 
 # ----------  Production-Ready Async Nodes  ----------
 class TopicWeightNode(AsyncParallelBatchNode):
@@ -352,6 +354,63 @@ class DirectionSynthesizerNode(AsyncNode):
         
         return "default"
 
+
+class EssayWriterNode(AsyncNode):
+    """Synthesize a research essay with advanced error handling"""
+
+    async def prep_async(self, shared):
+        topics = shared.get("topics", [])
+        gaps = shared.get("gaps", [])
+        directions = shared.get("directions", [])
+
+        logger.info(f"EssayWriterNode processing {len(topics)} topics, {len(gaps)} gaps, and {len(directions)} directions")
+        metrics.track_node_start("EssayWriterNode")
+
+        return {"topics": topics, "gaps": gaps, "directions": directions}
+
+    async def exec_async(self, data):
+        logger.info("Synthesizing research essay...")
+
+        try:
+            topics = data.get("topics", [])
+            gaps = data.get("gaps", [])
+            directions = data.get("directions", [])
+
+            if not topics and not gaps and not directions:
+                logger.warning("No topics, gaps or directions available for essay synthesis")
+                return "Could not generate an essay due to lack of information."
+
+            # Prepare context for the prompt
+            topics_text = json.dumps(topics, indent=2) if topics else "No specific topics identified"
+            gaps_text = "\n".join(f"- {gap}" for gap in gaps) if gaps else "No specific gaps identified"
+            directions_text = json.dumps(directions, indent=2) if directions else "No specific directions identified"
+
+            prompt = prompts.ESSAY_PROMPT.format(topics=topics_text, gaps=gaps_text, directions=directions_text)
+            raw_response = await llm.chat([{"role": "user", "content": prompt}])
+
+            if not raw_response:
+                logger.error("Empty LLM response for essay synthesis")
+                return "Could not generate an essay due to an LLM error."
+
+            return llm._strip_think(raw_response).strip()
+
+        except Exception as e:
+            logger.error(f"Error in essay synthesis: {str(e)}\n{traceback.format_exc()}")
+            return "Could not generate an essay due to an unexpected error."
+
+    async def post_async(self, shared, prep_res, exec_res):
+        essay = exec_res if exec_res else ""
+        shared["essay"] = essay
+
+        logger.info(f"Final research essay stored.")
+        metrics.track_node_end("EssayWriterNode", success=len(essay) > 0)
+
+        # Update streaming progress
+        push_stream_update(shared, f"ESSAY: Generated research essay")
+
+        return "default"
+
+
 class ResearchAgentNode(AsyncNode):
     """Enhanced research agent with real paper fetching and streaming updates"""
 
@@ -362,6 +421,7 @@ class ResearchAgentNode(AsyncNode):
         shared["streams"] = []
         shared["papers"] = []
         shared["search_queries"] = []
+        shared["exa_answer"] = None
 
         # Add the initial stream message directly to the shared state
         shared["streams"].append("STARTED: Starting research analysis...")
@@ -378,6 +438,7 @@ class ResearchAgentNode(AsyncNode):
         # Local lists to hold results, which will be returned for post_async
         local_streams = []
         papers = []
+        exa_answer = None
         
         try:
             local_streams.append(f"QUERY: Analyzing query: '{query}'")
@@ -396,6 +457,20 @@ class ResearchAgentNode(AsyncNode):
                 if arxiv_papers:
                     all_papers.extend(arxiv_papers)
                     local_streams.append(f"FOUND: {len(arxiv_papers)} papers from ArXiv")
+
+                # Search Exa
+                local_streams.append(f"EXA: Searching for: {search_query}")
+                exa_results, exa_answer = await call_exa_safe(search_query, k=2)
+                if exa_results:
+                    # Convert exa results to paper format
+                    for res in exa_results:
+                        all_papers.append({
+                            "title": res.get("title", ""),
+                            "authors": [],
+                            "summary": res.get("text", ""),
+                            "pdf_link": res.get("url", "")
+                        })
+                    local_streams.append(f"FOUND: {len(exa_results)} web results from Exa")
 
                 await asyncio.sleep(0.5) # Avoid rate limiting
 
@@ -417,6 +492,7 @@ class ResearchAgentNode(AsyncNode):
                 "papers": papers,
                 "streams": local_streams,
                 "search_queries": search_queries,
+                "exa_answer": exa_answer,
                 "success": True
             }
 
@@ -429,6 +505,7 @@ class ResearchAgentNode(AsyncNode):
                 "papers": self._get_fallback_papers(query),
                 "streams": local_streams,
                 "search_queries": search_queries if 'search_queries' in locals() else [],
+                "exa_answer": None,
                 "success": False
             }
 
@@ -478,10 +555,12 @@ class ResearchAgentNode(AsyncNode):
             papers = exec_res.get("papers", [])
             streams = exec_res.get("streams", [])
             search_queries = exec_res.get("search_queries", [])
+            exa_answer = exec_res.get("exa_answer")
             success = exec_res.get("success", False)
 
             shared["papers"] = papers
             shared["search_queries"] = search_queries
+            shared["exa_answer"] = exa_answer
             shared["streams"].extend(streams) # Append new streams from execution
 
             logger.info(f"ResearchAgent stored {len(papers)} papers")

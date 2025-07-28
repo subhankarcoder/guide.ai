@@ -74,6 +74,32 @@ REQUIRED JSON FORMAT:
 
 JSON OUTPUT:"""
 
+ESSAY_PROMPT = """
+You are a research assistant. Based on the provided research analysis, write a comprehensive, human-like essay in markdown format.
+
+The essay should summarize the findings, including the key topics, research gaps, and future directions.
+
+**IMPORTANT**:
+- The essay should be well-structured with a clear introduction, body, and conclusion.
+- Use markdown for formatting (e.g., headings, bold text, lists).
+- The tone should be professional and informative.
+- Do not include any JSON or code in the output.
+
+**RESEARCH ANALYSIS:**
+
+**Key Topics:**
+{topics}
+
+**Research Gaps:**
+{gaps}
+
+**Future Research Directions:**
+{directions}
+
+**ESSAY:**
+"""
+
+
 # Fallback prompts for when APIs fail
 FALLBACK_TOPICS = [
     {

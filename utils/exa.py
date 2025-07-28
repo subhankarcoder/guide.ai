@@ -16,16 +16,17 @@ except ImportError:
     exa_client = None
 
 async def search_web(query: str, k: int = 5):
-    """Enhanced web search with comprehensive error handling"""
+    """Enhanced web search with comprehensive error handling and answer retrieval"""
     if not exa_client:
         logger.warning("Exa client not available - returning empty results")
-        return []
+        return [], None
     
     loop = asyncio.get_running_loop()
     
     def _blocking_search():
         try:
-            response = exa_client.search_and_contents(
+            # Get search results
+            search_response = exa_client.search_and_contents(
                 query=query, 
                 num_results=k, 
                 text=True,
@@ -33,18 +34,22 @@ async def search_web(query: str, k: int = 5):
             )
             
             results = []
-            for result in response.results:
+            for result in search_response.results:
                 results.append({
                     "url": result.url,
                     "title": result.title or "Unknown Title",
                     "text": (result.text or "")[:1200],  # Limit text length
                     "highlights": getattr(result, 'highlights', [])
                 })
-                
-            return results
+
+            # Get a direct answer
+            answer_response = exa_client.search(query, use_autoprompt=True, type="answer")
+            answer = answer_response.answer if hasattr(answer_response, 'answer') else None
+
+            return results, answer
             
         except Exception as e:
             logger.error(f"Exa search error: {e}")
-            return []
+            return [], None
     
     return await loop.run_in_executor(None, _blocking_search)
