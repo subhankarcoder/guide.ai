@@ -1,4 +1,4 @@
-# improved_research_agent.py
+# research_agent.py - Enhanced version with AI answer
 import asyncio
 import json
 import logging
@@ -38,7 +38,7 @@ class ResearchGuideAgent:
         self.tools = tools_manager
         self.context = {}
         self.react_steps = []
-        self.max_iterations = 15
+        self.max_iterations = 12  # Reduced to prevent infinite loops
         
         # Tool descriptions for ReAct prompting
         self.tool_descriptions = {
@@ -73,36 +73,60 @@ class ResearchGuideAgent:
         """
         Process research query using ReAct framework with streaming
         """
+        start_time = time.time()
+        
         self.context = {
             "original_query": query,
             "papers_found": [],
             "topics_extracted": [],
             "gaps_identified": [],
             "research_directions": [],
-            "web_insights": []
+            "web_insights": [],
+            "arxiv_completed": False,
+            "exa_completed": False,
+            "analysis_completed": False
         }
         self.react_steps = []
         
         # Initial goal setting
         await self._add_thought(
             f"I need to provide comprehensive research guidance for the query: '{query}'. "
-            f"My goal is to analyze relevant research papers, identify key topics and gaps, "
-            f"and synthesize actionable research directions with proper sources.",
+            f"My goal is to: 1) Search ArXiv for academic papers, 2) Search web for current insights, "
+            f"3) Analyze topics and gaps from papers, 4) Synthesize actionable research directions.",
             stream_callback
         )
         
-        # ReAct loop
+        # ReAct loop with better termination conditions
         iteration = 0
+        consecutive_failures = 0
+        
         while iteration < self.max_iterations and not self._is_goal_achieved():
             iteration += 1
             
             # Reasoning step
             next_action = await self._reason_next_action(stream_callback)
             if not next_action:
+                await self._add_thought(
+                    "I have gathered sufficient information to provide research guidance. "
+                    "Moving to final synthesis.",
+                    stream_callback
+                )
                 break
                 
             # Action step
             action_result = await self._execute_action(next_action, stream_callback)
+            
+            # Check for consecutive failures
+            if isinstance(action_result, dict) and action_result.get("error"):
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    await self._add_thought(
+                        "Multiple tool failures detected. Proceeding with available data to provide best possible guidance.",
+                        stream_callback
+                    )
+                    break
+            else:
+                consecutive_failures = 0
             
             # Observation step
             await self._observe_result(action_result, stream_callback)
@@ -110,21 +134,27 @@ class ResearchGuideAgent:
             # Brief pause to prevent overwhelming
             await asyncio.sleep(0.1)
         
+        # Generate AI answer
+        ai_answer = await self._generate_ai_answer(stream_callback)
+        
         # Final synthesis
-        final_answer = await self._synthesize_final_answer(stream_callback)
+        final_answer = await self._synthesize_final_answer(ai_answer, stream_callback)
+        
+        processing_time = time.time() - start_time
         
         return {
             "query": query,
             "react_steps": [step.__dict__ for step in self.react_steps],
             "final_answer": final_answer,
             "context": self.context,
-            "processing_time": time.time() - self.react_steps[0].timestamp if self.react_steps else 0
+            "processing_time": processing_time
         }
 
     async def _add_thought(self, thought: str, stream_callback=None):
         """Add a reasoning step and stream it"""
         step = ReActStep("Thought", thought)
         self.react_steps.append(step)
+        logger.info(f"Thought: {thought[:100]}...")
         
         if stream_callback:
             await stream_callback({
@@ -135,75 +165,81 @@ class ResearchGuideAgent:
             })
 
     async def _reason_next_action(self, stream_callback=None) -> Optional[Dict[str, Any]]:
-        """Determine the next action based on current context"""
+        """Enhanced reasoning with better flow control"""
         
-        # Check what we have and what we need
         papers_count = len(self.context["papers_found"])
         topics_count = len(self.context["topics_extracted"])
         gaps_count = len(self.context["gaps_identified"])
         directions_count = len(self.context["research_directions"])
         web_insights_count = len(self.context["web_insights"])
         
-        # Reasoning logic
-        if papers_count == 0:
-            reasoning = "I haven't found any research papers yet. I should start by searching ArXiv for academic papers related to the query."
+        # Step 1: Get ArXiv papers first
+        if not self.context["arxiv_completed"]:
+            reasoning = "I need to start by searching ArXiv for academic papers related to the query. This will provide the foundation for research analysis."
             action = {
                 "tool": ToolType.ARXIV_SEARCH,
                 "input": {"search": self.context["original_query"]},
-                "rationale": "Need to gather academic papers as foundation for research analysis"
+                "rationale": "Gathering academic papers as foundation for research analysis"
             }
-        elif web_insights_count == 0:
-            reasoning = f"I have {papers_count} papers from ArXiv. Now I should search the web for current discussions and real-time insights about this topic."
+            
+        # Step 2: Get web insights
+        elif not self.context["exa_completed"]:
+            reasoning = f"I have searched ArXiv and found {papers_count} papers. Now I need to search the web for current discussions and real-time insights about this topic."
             action = {
                 "tool": ToolType.EXA_SEARCH,
                 "input": {"query": self.context["original_query"], "text": True},
-                "rationale": "Need current web insights to complement academic papers"
+                "rationale": "Gathering current web insights to complement academic papers"
             }
-        elif topics_count < papers_count:
-            reasoning = f"I have {papers_count} papers but only extracted topics from {topics_count}. I need to analyze more papers to extract their key topics and weights."
-            # Find unanalyzed papers
-            unanalyzed_papers = [p for p in self.context["papers_found"] if not p.get("topics_analyzed")]
-            if unanalyzed_papers:
-                paper = unanalyzed_papers[0]
-                action = {
-                    "tool": ToolType.TOPIC_ANALYZER,
-                    "input": {"summary": paper["summary"]},
-                    "rationale": f"Extracting topics from paper: '{paper['title'][:50]}...'"
-                }
-            else:
-                action = None
-        elif gaps_count < papers_count:
-            reasoning = f"I have analyzed topics for {topics_count} papers but only identified gaps for {gaps_count}. I need to identify research gaps in more papers."
-            # Find papers without gap analysis
-            ungapped_papers = [p for p in self.context["papers_found"] if not p.get("gaps_analyzed")]
-            if ungapped_papers:
-                paper = ungapped_papers[0]
-                action = {
-                    "tool": ToolType.GAP_IDENTIFIER,
-                    "input": {"title": paper["title"], "summary": paper["summary"]},
-                    "rationale": f"Identifying gaps in paper: '{paper['title'][:50]}...'"
-                }
-            else:
-                action = None
+            
+        # Step 3: Analyze topics from papers
+        elif topics_count == 0 and papers_count > 0:
+            reasoning = f"I have {papers_count} papers. Now I need to analyze them to extract key topics and their weights."
+            paper = self.context["papers_found"][0]  # Analyze first paper
+            action = {
+                "tool": ToolType.TOPIC_ANALYZER,
+                "input": {"summary": paper["summary"]},
+                "rationale": f"Extracting topics from: '{paper['title'][:50]}...'"
+            }
+            
+        # Step 4: Identify gaps from papers
+        elif gaps_count == 0 and papers_count > 0:
+            reasoning = f"I have analyzed some topics. Now I need to identify research gaps from the papers."
+            paper = self.context["papers_found"][0]  # Analyze first paper for gaps
+            action = {
+                "tool": ToolType.GAP_IDENTIFIER,
+                "input": {"title": paper["title"], "summary": paper["summary"]},
+                "rationale": f"Identifying gaps in: '{paper['title'][:50]}...'"
+            }
+            
+        # Step 5: Synthesize research directions
         elif directions_count == 0 and topics_count > 0 and gaps_count > 0:
-            reasoning = f"I have extracted {topics_count} topic sets and {gaps_count} gap analyses. Now I can synthesize research directions."
+            reasoning = f"I have extracted topics and identified gaps. Now I can synthesize concrete research directions."
+            # Flatten topics for synthesis
+            all_topics = []
+            for topic_set in self.context["topics_extracted"]:
+                if isinstance(topic_set, list):
+                    all_topics.extend(topic_set)
+                    
             action = {
                 "tool": ToolType.DIRECTION_SYNTHESIZER,
                 "input": {
-                    "topics": [topic for topic_set in self.context["topics_extracted"] for topic in topic_set],
-                    "gaps": self.context["gaps_identified"]
+                    "topics": all_topics[:10],  # Limit topics
+                    "gaps": self.context["gaps_identified"][:10]  # Limit gaps
                 },
-                "rationale": "Synthesizing final research directions from collected topics and gaps"
+                "rationale": "Synthesizing final research directions from collected data"
             }
+            
+        # Analysis complete
         else:
-            reasoning = "I have gathered sufficient information to provide comprehensive research guidance."
+            reasoning = "I have completed the analysis with sufficient information to provide comprehensive research guidance."
+            self.context["analysis_completed"] = True
             action = None
         
         await self._add_thought(reasoning, stream_callback)
         return action
 
     async def _execute_action(self, action: Dict[str, Any], stream_callback=None) -> Any:
-        """Execute the determined action"""
+        """Execute the determined action with enhanced error handling"""
         tool_type = action["tool"]
         tool_input = action["input"]
         rationale = action["rationale"]
@@ -216,6 +252,7 @@ class ResearchGuideAgent:
             tool_input=tool_input
         )
         self.react_steps.append(action_step)
+        logger.info(f"Action: {tool_type.value} - {rationale}")
         
         if stream_callback:
             await stream_callback({
@@ -227,18 +264,25 @@ class ResearchGuideAgent:
                 "timestamp": action_step.timestamp
             })
         
-        # Execute the tool
+        # Execute the tool with error handling
         try:
             if tool_type == ToolType.ARXIV_SEARCH:
                 result = await self.tools.arxiv_search(tool_input["search"])
+                self.context["arxiv_completed"] = True
+                
             elif tool_type == ToolType.EXA_SEARCH:
                 result = await self.tools.exa_search(tool_input["query"])
+                self.context["exa_completed"] = True
+                
             elif tool_type == ToolType.TOPIC_ANALYZER:
                 result = await self.tools.analyze_topics(tool_input["summary"])
+                
             elif tool_type == ToolType.GAP_IDENTIFIER:
                 result = await self.tools.identify_gaps(tool_input["title"], tool_input["summary"])
+                
             elif tool_type == ToolType.DIRECTION_SYNTHESIZER:
                 result = await self.tools.synthesize_directions(tool_input["topics"], tool_input["gaps"])
+                
             else:
                 result = {"error": f"Unknown tool: {tool_type}"}
             
@@ -246,64 +290,64 @@ class ResearchGuideAgent:
             return result
             
         except Exception as e:
+            logger.error(f"Tool execution failed: {e}")
             error_result = {"error": str(e)}
             action_step.tool_output = error_result
             return error_result
 
     async def _observe_result(self, result: Any, stream_callback=None):
-        """Observe and contextualize the action result"""
+        """Enhanced observation with better result processing"""
         
         if isinstance(result, dict) and "error" in result:
-            observation = f"Error occurred: {result['error']}. I'll need to adapt my approach."
+            observation = f"Tool execution failed: {result['error']}. I'll continue with available data."
         else:
             # Process result based on last action
             last_action = next((step for step in reversed(self.react_steps) if step.step_type == "Action"), None)
             
             if last_action and last_action.tool_used == ToolType.ARXIV_SEARCH.value:
                 paper_count = len(result) if isinstance(result, list) else 0
-                observation = f"Found {paper_count} research papers from ArXiv. Adding them to my knowledge base for analysis."
-                self.context["papers_found"].extend(result if isinstance(result, list) else [])
+                observation = f"Successfully found {paper_count} research papers from ArXiv. These will form the foundation of my analysis."
+                if isinstance(result, list):
+                    self.context["papers_found"].extend(result)
                 
             elif last_action and last_action.tool_used == ToolType.EXA_SEARCH.value:
-                insight_count = len(result) if isinstance(result, list) else 0
-                observation = f"Gathered {insight_count} web insights about the topic. This provides current context beyond academic papers."
-                self.context["web_insights"].extend(result if isinstance(result, list) else [])
+                if isinstance(result, tuple) and len(result) == 2:
+                    web_results, answer = result
+                    insight_count = len(web_results) if web_results else 0
+                    observation = f"Gathered {insight_count} web insights. This provides current context beyond academic papers."
+                    if web_results:
+                        self.context["web_insights"].extend(web_results)
+                else:
+                    observation = "Web search completed with limited results."
                 
             elif last_action and last_action.tool_used == ToolType.TOPIC_ANALYZER.value:
                 topic_count = len(result) if isinstance(result, list) else 0
-                observation = f"Extracted {topic_count} topics with their weights and subtopics. This helps understand the research landscape."
-                self.context["topics_extracted"].append(result if isinstance(result, list) else [])
-                # Mark paper as analyzed
-                if self.context["papers_found"]:
-                    for paper in self.context["papers_found"]:
-                        if not paper.get("topics_analyzed"):
-                            paper["topics_analyzed"] = True
-                            break
-                            
-            elif last_action and last_action.tool_used == ToolType.GAP_IDENTIFIER.value:
-                observation = f"Identified research gaps in the paper. These gaps reveal opportunities for future research."
+                observation = f"Extracted {topic_count} topics with their importance weights. This helps map the research landscape."
                 if isinstance(result, list):
+                    self.context["topics_extracted"].append(result)
+                    
+            elif last_action and last_action.tool_used == ToolType.GAP_IDENTIFIER.value:
+                if isinstance(result, list):
+                    gap_count = len(result)
                     self.context["gaps_identified"].extend(result)
                 else:
+                    gap_count = 1
                     self.context["gaps_identified"].append(result)
-                # Mark paper as gap-analyzed
-                if self.context["papers_found"]:
-                    for paper in self.context["papers_found"]:
-                        if not paper.get("gaps_analyzed"):
-                            paper["gaps_analyzed"] = True
-                            break
-                            
+                observation = f"Identified {gap_count} research gaps. These represent opportunities for future investigation."
+                    
             elif last_action and last_action.tool_used == ToolType.DIRECTION_SYNTHESIZER.value:
                 direction_count = len(result) if isinstance(result, list) else 0
                 observation = f"Synthesized {direction_count} concrete research directions with methods and expected impact."
-                self.context["research_directions"] = result if isinstance(result, list) else []
-                
+                if isinstance(result, list):
+                    self.context["research_directions"] = result
+                    
             else:
-                observation = f"Processed result: {str(result)[:100]}..."
+                observation = f"Processed result successfully."
 
         # Create observation step
         observation_step = ReActStep("Observation", observation)
         self.react_steps.append(observation_step)
+        logger.info(f"Observation: {observation}")
         
         if stream_callback:
             await stream_callback({
@@ -316,19 +360,108 @@ class ResearchGuideAgent:
     def _is_goal_achieved(self) -> bool:
         """Check if we have achieved our research guidance goal"""
         return (
-            len(self.context["papers_found"]) >= 3 and
-            len(self.context["topics_extracted"]) >= 2 and
-            len(self.context["gaps_identified"]) >= 2 and
-            len(self.context["research_directions"]) >= 1
+            self.context["analysis_completed"] or
+            (len(self.context["papers_found"]) >= 1 and
+             len(self.context["topics_extracted"]) >= 1 and
+             len(self.context["gaps_identified"]) >= 1 and
+             len(self.context["research_directions"]) >= 1)
         )
 
-    async def _synthesize_final_answer(self, stream_callback=None) -> Dict[str, Any]:
-        """Synthesize the final comprehensive research guidance"""
+    async def _generate_ai_answer(self, stream_callback=None) -> str:
+        """Generate comprehensive AI answer in markdown format"""
         
         await self._add_thought(
-            "Now I'll synthesize all the information I've gathered into comprehensive research guidance.",
+            "Now I'll synthesize all findings into a comprehensive research guide essay.",
             stream_callback
         )
+        
+        # Prepare data for essay generation
+        papers_count = len(self.context["papers_found"])
+        web_insights_count = len(self.context["web_insights"])
+        
+        # Flatten topics
+        all_topics = []
+        for topic_set in self.context["topics_extracted"]:
+            if isinstance(topic_set, list):
+                all_topics.extend(topic_set)
+        
+        # Create comprehensive essay
+        essay_parts = []
+        
+        # Introduction
+        essay_parts.append(f"# Research Guide: {self.context['original_query']}")
+        essay_parts.append("")
+        essay_parts.append(f"Based on my comprehensive analysis of {papers_count} academic papers and {web_insights_count} web sources, I'll provide you with a detailed research guide for **{self.context['original_query']}**.")
+        essay_parts.append("")
+        
+        # Current Landscape
+        essay_parts.append("## Current Research Landscape")
+        essay_parts.append("")
+        
+        if all_topics:
+            essay_parts.append("### Key Research Topics")
+            for i, topic in enumerate(all_topics[:8], 1):
+                if isinstance(topic, dict):
+                    topic_name = topic.get('topic', 'Unknown')
+                    weight = topic.get('weight', 'Medium')
+                    subtopics = topic.get('subtopics', [])
+                    
+                    essay_parts.append(f"**{i}. {topic_name}** (*{weight} Priority*)")
+                    if subtopics:
+                        essay_parts.append(f"   - Subtopics: {', '.join(subtopics[:3])}")
+                    essay_parts.append("")
+        
+        # Research Gaps
+        if self.context["gaps_identified"]:
+            essay_parts.append("## Identified Research Gaps")
+            essay_parts.append("")
+            essay_parts.append("Through my analysis, I've identified several key areas where current research is lacking:")
+            essay_parts.append("")
+            
+            for i, gap in enumerate(self.context["gaps_identified"][:5], 1):
+                gap_text = gap if isinstance(gap, str) else str(gap)
+                essay_parts.append(f"**{i}.** {gap_text}")
+                essay_parts.append("")
+        
+        # Research Directions
+        if self.context["research_directions"]:
+            essay_parts.append("## Recommended Research Directions")
+            essay_parts.append("")
+            essay_parts.append("Based on the identified gaps and current trends, here are my recommended research directions:")
+            essay_parts.append("")
+            
+            for i, direction in enumerate(self.context["research_directions"], 1):
+                if isinstance(direction, dict):
+                    question = direction.get('question', 'Research question not specified')
+                    methods = direction.get('methods', 'Methods not specified')
+                    impact = direction.get('impact', 'Impact not specified')
+                    
+                    essay_parts.append(f"### {i}. {question}")
+                    essay_parts.append(f"**Proposed Methods:** {methods}")
+                    essay_parts.append(f"**Expected Impact:** {impact}")
+                    essay_parts.append("")
+        
+        # Practical Recommendations
+        essay_parts.append("## Practical Next Steps")
+        essay_parts.append("")
+        essay_parts.append("To advance research in this field, I recommend:")
+        essay_parts.append("")
+        essay_parts.append("1. **Literature Review**: Start with the academic papers I've analyzed to understand the current state of research")
+        essay_parts.append("2. **Gap Analysis**: Focus on the identified research gaps as potential areas for contribution")
+        essay_parts.append("3. **Methodology Development**: Consider the proposed methods in my research directions")
+        essay_parts.append("4. **Collaboration**: Look for opportunities to collaborate with researchers working on complementary aspects")
+        essay_parts.append("")
+        
+        # Conclusion
+        essay_parts.append("## Conclusion")
+        essay_parts.append("")
+        essay_parts.append(f"The field of {self.context['original_query']} presents numerous opportunities for impactful research. By focusing on the identified gaps and following the recommended directions, researchers can make significant contributions to advancing knowledge in this area.")
+        essay_parts.append("")
+        
+        return "\n".join(essay_parts)
+
+    async def _synthesize_final_answer(self, ai_answer: str, stream_callback=None) -> Dict[str, Any]:
+        """Synthesize the final comprehensive research guidance"""
         
         # Compile sources
         sources = []
@@ -357,11 +490,12 @@ class ResearchGuideAgent:
         
         final_answer = {
             "research_query": self.context["original_query"],
+            "ai_answer": ai_answer,  # The comprehensive markdown essay
             "research_directions": self.context["research_directions"],
             "key_topics": all_topics[:10] if all_topics else [],
             "research_gaps": self.context["gaps_identified"][:10],
             "sources": sources,
-            "summary": f"Based on analysis of {len(self.context['papers_found'])} research papers and {len(self.context['web_insights'])} web sources, I've identified {len(self.context['research_directions'])} actionable research directions.",
+            "summary": f"Analyzed {len(self.context['papers_found'])} academic papers and {len(self.context['web_insights'])} web sources to identify {len(self.context['research_directions'])} actionable research directions.",
             "methodology": "Used ReAct framework to systematically search academic papers, analyze web insights, extract topics, identify gaps, and synthesize research directions."
         }
         
@@ -375,7 +509,7 @@ class ResearchGuideAgent:
         return final_answer
 
 
-# Enhanced Tools Manager that works with existing utilities
+# Enhanced Tools Manager with better error handling
 class ToolsManager:
     """
     Manages all research tools with proper error handling
@@ -387,22 +521,30 @@ class ToolsManager:
         self.llm = llm_util
 
     async def arxiv_search(self, query: str, k: int = 5) -> List[Dict]:
-        """Search ArXiv papers"""
+        """Search ArXiv papers with timeout"""
         try:
-            results = await self.arxiv.search(query, k)
+            logger.info(f"ArXiv search: {query}")
+            results = await asyncio.wait_for(self.arxiv.search(query, k), timeout=60.0)
             return results if results else []
+        except asyncio.TimeoutError:
+            logger.error("ArXiv search timeout")
+            return []
         except Exception as e:
             logger.error(f"ArXiv search failed: {e}")
             return []
 
-    async def exa_search(self, query: str, k: int = 5) -> List[Dict]:
-        """Search web using Exa"""
+    async def exa_search(self, query: str, k: int = 5) -> tuple:
+        """Search web using Exa with timeout"""
         try:
-            results = await self.exa.search_web(query, k)
-            return results if results else []
+            logger.info(f"Exa search: {query}")
+            results = await asyncio.wait_for(self.exa.search_web(query, k), timeout=60.0)
+            return results if results else ([], None)
+        except asyncio.TimeoutError:
+            logger.error("Exa search timeout")
+            return [], None
         except Exception as e:
             logger.error(f"Exa search failed: {e}")
-            return []
+            return [], None
 
     async def analyze_topics(self, summary: str) -> List[Dict]:
         """Extract topics from paper summary"""

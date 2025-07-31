@@ -1,4 +1,4 @@
-# utils/exa.py
+# utils/exa.py - Fixed version
 import os
 import asyncio
 import logging
@@ -16,7 +16,7 @@ except ImportError:
     exa_client = None
 
 async def search_web(query: str, k: int = 5):
-    """Enhanced web search with comprehensive error handling and answer retrieval"""
+    """Enhanced web search with fixed API parameters"""
     if not exa_client:
         logger.warning("Exa client not available - returning empty results")
         return [], None
@@ -25,12 +25,15 @@ async def search_web(query: str, k: int = 5):
     
     def _blocking_search():
         try:
-            # Get search results
+            logger.info(f"Exa search for: '{query}' with {k} results")
+            
+            # Fixed search call - removed invalid parameters
             search_response = exa_client.search_and_contents(
                 query=query, 
                 num_results=k, 
                 text=True,
-                highlights=True
+                highlights=True,
+                # Removed type parameter that was causing 400 error
             )
             
             results = []
@@ -42,9 +45,24 @@ async def search_web(query: str, k: int = 5):
                     "highlights": getattr(result, 'highlights', [])
                 })
 
-            # Get a direct answer
-            answer_response = exa_client.search(query, use_autoprompt=True, type="answer")
-            answer = answer_response.answer if hasattr(answer_response, 'answer') else None
+            logger.info(f"Exa search successful: {len(results)} results")
+            
+            # Try to get answer using a separate call if needed
+            answer = None
+            try:
+                # Use basic search for answer if available
+                answer_response = exa_client.search(
+                    query=query,
+                    num_results=1,
+                    use_autoprompt=True
+                )
+                if hasattr(answer_response, 'results') and answer_response.results:
+                    # Extract answer from first result
+                    first_result = answer_response.results[0]
+                    answer = getattr(first_result, 'text', None) or getattr(first_result, 'summary', None)
+            except Exception as answer_error:
+                logger.warning(f"Could not get Exa answer: {answer_error}")
+                answer = None
 
             return results, answer
             
